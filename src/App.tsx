@@ -1,85 +1,170 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
+import {
+  evaluateReading,
+  findPreviousReading,
+  reevaluateAfterCorrection,
+  validateRelease,
+  type BorescopeRecord,
+  type Reading,
+  type RegisterInput,
+} from "./domain/judgment";
+import { engines, instruments, personnel, seedRecords, stations } from "./data/reference";
+import { loadRecords, resetStorage, saveRecords } from "./storage/local";
+import RegisterPage from "./pages/RegisterPage";
+import EnginePage from "./pages/EnginePage";
+
+type Tab = "register" | "review";
 
 const project = {
-  "id": "hxwl-07",
-  "port": 5107,
-  "title": "航空维修检查清单",
-  "subtitle": "按ATA章节推进维修放行前检查",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#1d4ed8",
-    "#475569",
-    "#f97316"
-  ],
-  "domain": "航空维修",
-  "users": [
-    "维修工程师",
-    "放行人员",
-    "培训教员"
-  ],
-  "metrics": [
-    "完成率",
-    "缺陷项",
-    "待复核",
-    "ATA章节"
-  ],
-  "filters": [
-    "机体",
-    "动力装置",
-    "航电",
-    "起落架"
-  ],
-  "fields": [
-    "机型",
-    "ATA章节",
-    "检查区域",
-    "检查项目",
-    "缺陷描述",
-    "处理意见",
-    "签署人"
-  ],
-  "records": [
-    [
-      "A320",
-      "ATA 32",
-      "起落架",
-      "待复核",
-      "主轮磨耗接近限制"
-    ],
-    [
-      "B737",
-      "ATA 24",
-      "电源系统",
-      "正常",
-      "电瓶电压检查完成"
-    ],
-    [
-      "ARJ21",
-      "ATA 27",
-      "飞控",
-      "缺陷",
-      "副翼作动测试需复查"
-    ]
-  ]
+  id: "hxwl-07",
+  port: 5107,
+  title: "孔探复核台",
+  subtitle: "按发动机和站位登记叶片孔探读数，超差、仪器过期、资质失效一律停在待评估，由另一名放行人员填写工程依据后放行",
 };
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
-
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
-  );
+function todayIso(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
 function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  const [records, setRecords] = useState<BorescopeRecord[]>(() => loadRecords(seedRecords));
+  const [tab, setTab] = useState<Tab>("register");
+  const today = todayIso();
+
+  // 本机保存：每次变化即落盘，重开页面记录仍在
+  useEffect(() => {
+    saveRecords(records);
+  }, [records]);
+
+  const inspectors = useMemo(() => personnel.filter((person) => person.roles.includes("检查")), []);
+
+  const registerRecord = (input: RegisterInput): BorescopeRecord => {
+    const inspector = personnel.find((person) => person.id === input.inspectorId)!;
+    const instrument = instruments.find((item) => item.id === input.instrumentId)!;
+    const previous = findPreviousReading(records, input);
+    const holdReasons = evaluateReading({
+      reading: input.reading,
+      previous,
+      instrument,
+      inspector,
+      inspectedAt: input.inspectedAt,
+    });
+
+    const record: BorescopeRecord = {
+      id: `R-${input.inspectedAt.replace(/-/g, "")}-${Date.now().toString(36).toUpperCase().slice(-4)}`,
+      engineId: input.engineId,
+      station: input.station,
+      bladeNo: input.bladeNo,
+      inspectorId: input.inspectorId,
+      instrumentId: input.instrumentId,
+      inspectedAt: input.inspectedAt,
+      status: holdReasons.length > 0 ? "待评估" : "已放行",
+      holdReasons,
+      versions: [
+        {
+          version: 1,
+          ...input.reading,
+          reason: "首次登记",
+          savedBy: inspector.name,
+          savedAt: input.inspectedAt,
+        },
+      ],
+      // 无保留项的读数按正常流程登记即放行并锁定；有保留项必须走复核
+      ...(holdReasons.length === 0
+        ? {
+            release: {
+              releaserId: "SYSTEM",
+              releaserName: "登记判定无保留项",
+              engineeringBasis: "登记时判定无增长超差、仪器与资质均有效，按正常流程放行。",
+              releasedAt: input.inspectedAt,
+            },
+          }
+        : {}),
+    };
+
+    setRecords((prev) => [...prev, record]);
+    return record;
+  };
+
+  const releaseRecord = (recordId: string, releaserId: string, engineeringBasis: string) => {
+    const releaser = personnel.find((person) => person.id === releaserId);
+    setRecords((prev) =>
+      prev.map((record) => {
+        if (record.id !== recordId) return record;
+        if (validateRelease(record, releaser, engineeringBasis)) return record;
+        return {
+          ...record,
+          status: "已放行",
+          release: {
+            releaserId,
+            releaserName: releaser!.name,
+            engineeringBasis,
+            releasedAt: today,
+          },
+        };
+      })
+    );
+  };
+
+  const correctRecord = (
+    recordId: string,
+    reading: Reading,
+    reason: string,
+    savedBy: string
+  ) => {
+    setRecords((prev) =>
+      prev.map((record) => {
+        if (record.id !== recordId) return record;
+        const instrument = instruments.find((item) => item.id === record.instrumentId)!;
+        const inspector = personnel.find((person) => person.id === record.inspectorId)!;
+        const verdict = reevaluateAfterCorrection(prev, record, reading, instrument, inspector);
+        return {
+          ...record,
+          ...verdict,
+          versions: [
+            ...record.versions,
+            {
+              version: record.versions.length + 1,
+              ...reading,
+              reason,
+              savedBy,
+              savedAt: today,
+            },
+          ],
+        };
+      })
+    );
+  };
+
+  const restoreSeed = () => {
+    resetStorage();
+    setRecords(seedRecords);
+  };
+
+  const todoCount = records.filter((record) => record.status === "待评估").length;
+  const releasedCount = records.length - todoCount;
+  const expiredInstruments = new Set(
+    instruments.filter((item) => item.calibrationDue < today).map((item) => item.id)
+  );
+  const expiredPeople = new Set(
+    personnel.filter((person) => person.qualificationDue < today).map((person) => person.id)
+  );
+  const staleResourceCount =
+    new Set(
+      records
+        .filter((record) => expiredInstruments.has(record.instrumentId) || expiredPeople.has(record.inspectorId))
+        .map((record) => record.id)
+    ).size;
+
+  const metrics = [
+    { label: "在册发动机", value: String(engines.length) },
+    { label: "待评估待办", value: String(todoCount) },
+    { label: "已放行记录", value: String(releasedCount) },
+    { label: "涉过期资料记录", value: String(staleResourceCount) },
+  ];
+
+  const statusColors = ["status-ok", "status-danger", "status-watch", "status-danger"];
 
   return (
     <main className="app-shell">
@@ -90,72 +175,61 @@ function App() {
           <p className="subtitle">{project.subtitle}</p>
         </div>
         <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
+          <span>分层结构</span>
+          <strong>资料 data · 判定 domain · 本机保存 storage · 页面 pages</strong>
         </div>
       </section>
 
       <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
+        {metrics.map((metric, index) => (
+          <article key={metric.label} className="metric-card">
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+            <i className={statusColors[index]} />
+          </article>
         ))}
       </section>
 
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
+      <nav className="tabs">
+        <button
+          className={tab === "register" ? "tab tab-active" : "tab"}
+          onClick={() => setTab("register")}
+        >
+          登记读数
+        </button>
+        <button
+          className={tab === "review" ? "tab tab-active" : "tab"}
+          onClick={() => setTab("review")}
+        >
+          发动机复核 {todoCount > 0 && <em className="tab-dot">{todoCount}</em>}
+        </button>
+        <button className="tab tab-reset" onClick={restoreSeed} title="清空本机数据并恢复示例">
+          恢复示例数据
+        </button>
+      </nav>
 
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
+      {tab === "register" ? (
+        <RegisterPage
+          engines={engines}
+          stations={stations}
+          inspectors={inspectors}
+          instruments={instruments}
+          today={today}
+          onRegister={registerRecord}
+        />
+      ) : (
+        <EnginePage
+          records={records}
+          engines={engines}
+          personnel={personnel}
+          onRelease={releaseRecord}
+          onCorrect={correctRecord}
+        />
+      )}
 
-      <section className="records panel">
-        <div className="section-heading">
-          <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      <footer className="page-foot">
+        最近读数：{records.length} 条记录保存在本机浏览器；放行后读数锁定，更正另存版本并保留旧值。
+      </footer>
     </main>
   );
 }
