@@ -1,161 +1,172 @@
+import { useMemo, useState } from "react";
 import "./styles.css";
+import { RegistrationPage } from "./pages/RegistrationPage";
+import { EngineBoardPage } from "./pages/EngineBoardPage";
+import { ReferencePage } from "./pages/ReferencePage";
+import { RecordDetail } from "./components/RecordDetail";
+import { useDatabase } from "./storage/useDatabase";
+import { evaluate } from "./rules/evaluation";
+import type { BorescopeRecord } from "./data/types";
 
-const project = {
-  "id": "hxwl-07",
-  "port": 5107,
-  "title": "航空维修检查清单",
-  "subtitle": "按ATA章节推进维修放行前检查",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#1d4ed8",
-    "#475569",
-    "#f97316"
-  ],
-  "domain": "航空维修",
-  "users": [
-    "维修工程师",
-    "放行人员",
-    "培训教员"
-  ],
-  "metrics": [
-    "完成率",
-    "缺陷项",
-    "待复核",
-    "ATA章节"
-  ],
-  "filters": [
-    "机体",
-    "动力装置",
-    "航电",
-    "起落架"
-  ],
-  "fields": [
-    "机型",
-    "ATA章节",
-    "检查区域",
-    "检查项目",
-    "缺陷描述",
-    "处理意见",
-    "签署人"
-  ],
-  "records": [
-    [
-      "A320",
-      "ATA 32",
-      "起落架",
-      "待复核",
-      "主轮磨耗接近限制"
-    ],
-    [
-      "B737",
-      "ATA 24",
-      "电源系统",
-      "正常",
-      "电瓶电压检查完成"
-    ],
-    [
-      "ARJ21",
-      "ATA 27",
-      "飞控",
-      "缺陷",
-      "副翼作动测试需复查"
-    ]
-  ]
+type Tab = "board" | "register" | "reference";
+
+const PROJECT = {
+  id: "hxwl-07",
+  port: 5107,
+  title: "发动机孔探复核台",
+  subtitle: "按发动机与站位登记叶片读数：超差增长、仪器过期、资质失效一律停在待评估，由另一名放行人员填写工程依据后放行。",
 };
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
-
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
+function MetricCard({
+  label,
+  value,
+  hint,
+  tone,
+}: {
+  label: string;
+  value: string | number;
+  hint: string;
+  tone: "ok" | "warn" | "danger" | "plain";
+}) {
   return (
-    <article className="metric-card">
+    <article className={`metric-card metric-${tone}`}>
       <span>{label}</span>
       <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
+      <small>{hint}</small>
     </article>
   );
 }
 
 function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  const {
+    db,
+    loading,
+    error,
+    persistRecord,
+    persistEngine,
+    persistInspector,
+    persistInstrument,
+  } = useDatabase();
+  const [tab, setTab] = useState<Tab>("board");
+  const [activeRecordId, setActiveRecordId] = useState<string | null>(null);
+
+  const metrics = useMemo(() => {
+    if (!db) return null;
+    const pending = db.records.filter((r) => r.status === "pending");
+    const blocked = pending.filter(
+      (r) => evaluate(r, db.records, db.inspectors, db.instruments).blockers.length > 0
+    );
+    const released = db.records.length - pending.length;
+    const todos = pending.filter((r) => (r.todoNote ?? "").trim().length > 0);
+    return {
+      pendingCount: pending.length,
+      blockedCount: blocked.length,
+      releasedCount: released,
+      todoCount: todos.length,
+    };
+  }, [db]);
+
+  const activeRecord = useMemo(
+    () => (db && activeRecordId ? db.records.find((r) => r.id === activeRecordId) ?? null : null),
+    [db, activeRecordId]
+  );
+
+  const openRecord = (record: BorescopeRecord) => setActiveRecordId(record.id);
+
+  const handlePersistFromDrawer = async (record: BorescopeRecord) => {
+    await persistRecord(record);
+  };
+
+  if (loading) {
+    return (
+      <main className="app-shell">
+        <p className="loading-line">正在打开本机孔探资料库…</p>
+      </main>
+    );
+  }
 
   return (
     <main className="app-shell">
       <section className="hero">
         <div>
-          <p className="eyebrow">{project.id} · port {project.port}</p>
-          <h1>{project.title}</h1>
-          <p className="subtitle">{project.subtitle}</p>
+          <p className="eyebrow">{PROJECT.id} · port {PROJECT.port}</p>
+          <h1>{PROJECT.title}</h1>
+          <p className="subtitle">{PROJECT.subtitle}</p>
         </div>
         <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
+          <span>分层维护</span>
+          <strong>资料（data）/ 判定（rules）/ 本机保存（storage）/ 页面（pages）</strong>
+          <span className="muted-note">数据保存在浏览器 IndexedDB，重开不丢失。</span>
         </div>
       </section>
 
-      <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
-        ))}
-      </section>
+      {error && <p className="field-error">{error}</p>}
 
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
+      {metrics && (
+        <section className="metrics-grid">
+          <MetricCard
+            label="待评估"
+            value={metrics.pendingCount}
+            hint="等待放行人员复核签署"
+            tone={metrics.blockedCount > 0 ? "danger" : "warn"}
+          />
+          <MetricCard
+            label="硬阻断待处理"
+            value={metrics.blockedCount}
+            hint="增长超 1mm / 仪器过期 / 资质失效"
+            tone="danger"
+          />
+          <MetricCard
+            label="已放行（读数锁定）"
+            value={metrics.releasedCount}
+            hint="更正须另存版本并保留旧值"
+            tone="ok"
+          />
+          <MetricCard
+            label="待办事项"
+            value={metrics.todoCount}
+            hint="挂在待评估记录上的后续工作"
+            tone="plain"
+          />
         </section>
-      </section>
+      )}
 
-      <section className="records panel">
-        <div className="section-heading">
-          <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      <nav className="tabs">
+        <button className={tab === "board" ? "tab-on" : ""} onClick={() => setTab("board")}>
+          按发动机复核
+        </button>
+        <button className={tab === "register" ? "tab-on" : ""} onClick={() => setTab("register")}>
+          孔探登记
+        </button>
+        <button className={tab === "reference" ? "tab-on" : ""} onClick={() => setTab("reference")}>
+          资料维护
+        </button>
+      </nav>
+
+      {db && tab === "board" && <EngineBoardPage db={db} onOpenRecord={openRecord} />}
+      {db && tab === "register" && (
+        <RegistrationPage db={db} onPersist={persistRecord} onOpenRecord={openRecord} />
+      )}
+      {db && tab === "reference" && (
+        <ReferencePage
+          db={db}
+          onPersistEngine={persistEngine}
+          onPersistInspector={persistInspector}
+          onPersistInstrument={persistInstrument}
+        />
+      )}
+
+      {db && activeRecord && (
+        <RecordDetail
+          record={activeRecord}
+          records={db.records}
+          engines={db.engines}
+          inspectors={db.inspectors}
+          instruments={db.instruments}
+          onClose={() => setActiveRecordId(null)}
+          onPersist={handlePersistFromDrawer}
+        />
+      )}
     </main>
   );
 }
